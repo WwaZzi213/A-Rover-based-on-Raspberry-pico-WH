@@ -2,9 +2,69 @@
 
 基于 Raspberry Pi Pico WH (RP2040 + CYW43439) 的 BLE 遥控小车固件。
 
-与 UDP 版本保持完全相同的**协议格式**和**代码结构**，便于直接对比两种传输方式的性能差异。
+
+
+## #####################################
+## #####################################
+## ！！！！！！！！！编译！！！！！！！！！
+## #####################################
+## #####################################
+## 构建
+
+```bash
+cd 你存放文件的path
+mkdir build
+cd build
+cmake .. -G Ninja -DPICO_BOARD=pico_w
+ninja
+```
+## 控制端
+python rover_ctrl_outdoor_V1_win.py --name ROVER_BLE
+
+烧录：按住 BOOTSEL，将 `uf2` 拖入 RPI-RP2 驱动器。
 
 ---
+## #####################################
+## #####################################
+## ！！！！！！！！！编译！！！！！！！！！
+## #####################################
+## #####################################
+## #####################################
+
+
+## 硬件接线（默认，可在 config.h 修改）
+
+| 信号        | GPIO |
+|-------------|------|
+| 左轮 PWM    | 2    |
+| 左轮 DIR    | 3    |
+| 右轮 PWM    | 0    |
+| 右轮 DIR    | 5    |
+
+右轮默认反向（`RIGHT_MOTOR_INVERT 1`），如需正向请改为 `0`。
+
+---
+
+## 测试控制器
+
+```bash
+pip install bleak
+python tools/test_controller.py --name ROVER_BLE
+# W/S=前进/后退  A/D=左转/右转  SPACE=刹车  Q=退出
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## 文件结构
 
@@ -68,14 +128,16 @@ pico_ble_rover/
 ## 构建
 
 ```bash
-export PICO_SDK_PATH=/path/to/pico-sdk
-cd pico_ble_rover
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cd path
+mkdir build
+cd build
+cmake .. -G Ninja -DPICO_BOARD=pico_w
+ninja
 ```
+## 控制端
+python rover_ctrl_outdoor_V1_win.py --name ROVER_BLE
 
-烧录：按住 BOOTSEL，将 `build/pico_ble_rover.uf2` 拖入 RPI-RP2 驱动器。
+烧录：按住 BOOTSEL，将 `uf2` 拖入 RPI-RP2 驱动器。
 
 ---
 
@@ -118,15 +180,3 @@ python tools/test_controller.py --name ROVER_BLE
 | apply_avg/max | rx→电机输出延迟均值/峰值（us）  |
 | fs_total      | 累计触发失联次数                |
 
----
-
-## 与 UDP 版性能对比
-
-| 指标             | UDP/Wi-Fi | BLE        |
-|------------------|-----------|------------|
-| 典型 RTT         | 1–10 ms   | 10–50 ms   |
-| 吞吐量上限       | 高        | 中（BLE 5.0 ~ 2 Mbps） |
-| 配网步骤         | 需连 Wi-Fi | 免配网，直连 |
-| 传输距离         | ~30 m     | ~10–30 m   |
-| 协议格式         | 完全相同  | 完全相同   |
-| 统计日志格式     | 完全相同  | 完全相同   |
