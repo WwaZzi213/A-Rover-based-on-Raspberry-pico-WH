@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ROVER_BLE Controller</title>
+<style>
+  body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+  h2   { color: #0f9; }
+  button { margin: 5px; padding: 10px 20px; font-size: 14px; cursor: pointer; border-radius: 6px; border: none; }
+  #connect    { background: #0f9; color: #000; }
+  #disconnect { background: #f55; color: #fff; }
+  #startStop  { background: #fa0; color: #000; }
+  #status  { margin-top: 12px; padding: 8px; background: #222; border-radius: 6px; }
+  #log     { margin-top: 12px; height: 200px; overflow-y: auto; background: #111; padding: 8px; border-radius: 6px; font-size: 12px; }
+  .ctrl    { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .key     { width: 60px; height: 60px; display:flex; align-items:center; justify-content:center;
+             background: #333; border-radius: 8px; font-size: 22px; user-select: none; cursor: pointer;
+             border: 2px solid #555; transition: background 0.1s; }
+  .key.active { background: #0f9; color: #000; }
+  #telemetry { margin-top: 10px; background: #1a1a2e; border: 1px solid #0f9; padding: 8px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h2>🚗 ROVER_BLE Web Controller</h2>
+
+<div>
+  <button id="connect">Connect BLE</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <button id="startStop" disabled>Start Sending (50Hz)</button>
+</div>
+
+<div id="status">Status: Not connected</div>
+
+<!-- WASD keyboard hint -->
+<div class="ctrl">
+  <div style="display:grid;grid-template-areas:'_ W _' 'A S D';gap:4px">
+    <div class="key" id="kW" style="grid-area:W">W</div>
+    <div class="key" id="kA" style="grid-area:A">A</div>
+    <div class="key" id="kS" style="grid-area:S">S</div>
+    <div class="key" id="kD" style="grid-area:D">D</div>
+  </div>
+  <div style="margin-left:20px;align-self:center;font-size:13px;">
+    W = Forward<br>S = Backward<br>A = Turn Left<br>D = Turn Right<br>Space = Brake
+  </div>
+</div>
+
+<div id="telemetry">
+  <b>Telemetry</b><br>
+  seq_echo: <span id="tSeq">-</span> &nbsp;
+  applied_L: <span id="tLeft">-</span> &nbsp;
+  applied_R: <span id="tRight">-</span> &nbsp;
+  RTT_ms: <span id="tRtt">-</span>
+</div>
+
+<div id="log"></div>
+
+<script>
+// ─── Constants ────────────────────────────────────────────────────────────────
+const SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
+const CMD_UUID     = '12345678-1234-1234-1234-1234567890ac';
+const ACK_UUID     = '12345678-1234-1234-1234-1234567890ad';
+
+const MAGIC = [0x52, 0x56];  // 'R','V'
+const VER   = 1;
+const PWM_MAX = 1000;
+const SEND_INTERVAL_MS = 20; // 50 Hz
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let device, server, service, cmdChar, ackChar;
+let seq = 0;
+let sending = false;
+let sendTimer = null;
+let leftVal = 0, rightVal = 0;
+let enable = false;
+let brake  = false;
+
+// Key press state
+const keys = { w: false, a: false, s: false, d: false, ' ': false };
+
+// RTT tracking: seq -> send timestamp
+const rttMap = new Map();
+
+// ─── Log helper ───────────────────────────────────────────────────────────────
+function log(msg) {
+  const el = document.getElementById('log');
+  const ts = new Date().toISOString().substr(11, 12);
+  el.innerHTML += `<div>[${ts}] ${msg}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = 'Status: ' + msg;
+}
+
+// ─── CRC16-CCITT ──────────────────────────────────────────────────────────────
+function crc16(bytes) {
+  let crc = 0xFFFF;
+  for (const b of bytes) {
+    crc ^= b << 8;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xFFFF;
+    }
+  }
+  return crc;
+}
+
+// ─── Build CMD packet ─────────────────────────────────────────────────────────
+function buildCmd(left, right, en, brk) {
+  const buf  = new ArrayBuffer(16);
+  const view = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+
+  view.setUint8(0, MAGIC[0]);          // magic[0]
+  view.setUint8(1, MAGIC[1]);          // magic[1]
+  view.setUint8(2, VER);               // ver
+  let flags = 0;
+  if (en)  flags |= 0x01;
+  if (brk) flags |= 0x02;
+  view.setUint8(3, flags);             // flags
+  view.setUint32(4, seq, true);        // seq (little-endian)
+  view.setInt16(8,  left,  true);      // left
+  view.setInt16(10, right, true);      // right
+  // CRC over bytes 0..13
+  const crc = crc16(bytes.subarray(0, 14));
+  view.setUint16(14, crc, true);       // crc16
+
+  seq = (seq + 1) >>> 0;              // wrap at 32-bit
+  return buf;
+}
+
+// ─── Connect ─────────────────────────────────────────────────────────────────
+document.getElementById('connect').onclick = async () => {
+  try {
+    setStatus('Scanning...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'ROVER_BLE' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setStatus('Connecting...');
+    server  = await device.gatt.connect();
+    service = await server.getPrimaryService(SERVICE_UUID);
+    cmdChar = await service.getCharacteristic(CMD_UUID);
+    ackChar = await service.getCharacteristic(ACK_UUID);
+
+    // Subscribe to ACK notifications
+    await ackChar.startNotifications();
+    ackChar.addEventListener('characteristicvaluechanged', onAckNotify);
+
+    setStatus(`Connected to ${device.name}`);
+    log(`Connected to ${device.name}`);
+    document.getElementById('disconnect').disabled = false;
+    document.getElementById('startStop').disabled  = false;
+    enable = true;
+  } catch (e) {
+    setStatus('Connection failed: ' + e.message);
+    log('Error: ' + e);
+  }
+};
+
+// ─── Disconnect ───────────────────────────────────────────────────────────────
+document.getElementById('disconnect').onclick = () => {
+  stopSending();
+  if (device && device.gatt.connected) device.gatt.disconnect();
+};
+
+function onDisconnected() {
+  stopSending();
+  setStatus('Disconnected');
+  log('Disconnected');
+  enable = false;
+  document.getElementById('disconnect').disabled = true;
+  document.getElementById('startStop').disabled  = true;
+}
+
+// ─── Send loop ────────────────────────────────────────────────────────────────
+document.getElementById('startStop').onclick = () => {
+  if (sending) stopSending(); else startSending();
+};
+
+function startSending() {
+  sending = true;
+  document.getElementById('startStop').textContent = 'Stop Sending';
+  sendTimer = setInterval(sendCmd, SEND_INTERVAL_MS);
+  log('Started sending at ' + (1000/SEND_INTERVAL_MS) + ' Hz');
+}
+
+function stopSending() {
+  sending = false;
+  if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+  document.getElementById('startStop').textContent = 'Start Sending (50Hz)';
+}
+
+function sendCmd() {
+  if (!cmdChar) return;
+  computeMotorValues();
+  const buf = buildCmd(leftVal, rightVal, enable, brake);
+  const currentSeq = seq - 1;  // seq was already incremented
+  rttMap.set(currentSeq, performance.now());
+  cmdChar.writeValueWithoutResponse(buf).catch(e => log('Write error: ' + e));
+}
+
+// ─── Motor value calculation from WASD ────────────────────────────────────────
+function computeMotorValues() {
+  brake = keys[' '];
+  if (brake) { leftVal = 0; rightVal = 0; return; }
+
+  let fwd = 0, turn = 0;
+  if (keys['w']) fwd  =  PWM_MAX;
+  if (keys['s']) fwd  = -PWM_MAX;
+  if (keys['a']) turn = -400;
+  if (keys['d']) turn =  400;
+
+  leftVal  = Math.max(-PWM_MAX, Math.min(PWM_MAX, fwd + turn));
+  rightVal = Math.max(-PWM_MAX, Math.min(PWM_MAX, fwd - turn));
+}
+
+// ─── ACK Notify handler ───────────────────────────────────────────────────────
+function onAckNotify(event) {
+  const view = new DataView(event.target.value.buffer);
+  // Parse ack_packet_t:
+  // magic[2], ver, status, seq_echo(u32 LE), applied_left(i16 LE), applied_right(i16 LE), t_us(u32 LE)
+  const magic0 = view.getUint8(0);
+  const magic1 = view.getUint8(1);
+  if (magic0 !== 0x52 || magic1 !== 0x41) return;  // 'R','A'
+
+  const status       = view.getUint8(3);
+  const seqEcho      = view.getUint32(4, true);
+  const appLeft      = view.getInt16(8, true);
+  const appRight     = view.getInt16(10, true);
+  const tUs          = view.getUint32(12, true);
+
+  // RTT
+  const sentAt = rttMap.get(seqEcho);
+  let rtt = '-';
+  if (sentAt !== undefined) {
+    rtt = (performance.now() - sentAt).toFixed(1);
+    rttMap.delete(seqEcho);
+  }
+
+  document.getElementById('tSeq').textContent   = seqEcho;
+  document.getElementById('tLeft').textContent  = appLeft;
+  document.getElementById('tRight').textContent = appRight;
+  document.getElementById('tRtt').textContent   = rtt + ' ms';
+
+  console.log(`ACK seq=${seqEcho} L=${appLeft} R=${appRight} RTT=${rtt}ms status=${status}`);
+}
+
+// ─── Keyboard input ───────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k in keys) { keys[k] = true; e.preventDefault(); updateKeyUI(); }
+});
+document.addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  if (k in keys) { keys[k] = false; e.preventDefault(); updateKeyUI(); }
+});
+
+function updateKeyUI() {
+  document.getElementById('kW').classList.toggle('active', keys['w']);
+  document.getElementById('kA').classList.toggle('active', keys['a']);
+  document.getElementById('kS').classList.toggle('active', keys['s']);
+  document.getElementById('kD').classList.toggle('active', keys['d']);
+}
+
+// Touch support for on-screen keys
+['W','A','S','D'].forEach(k => {
+  const el = document.getElementById('k'+k);
+  const kl = k.toLowerCase();
+  el.addEventListener('pointerdown', () => { keys[kl] = true;  updateKeyUI(); });
+  el.addEventListener('pointerup',   () => { keys[kl] = false; updateKeyUI(); });
+  el.addEventListener('pointerout',  () => { keys[kl] = false; updateKeyUI(); });
+});
+
+// ─── Feature detection ────────────────────────────────────────────────────────
+if (!navigator.bluetooth) {
+  document.getElementById('connect').disabled = true;
+  setStatus('Web Bluetooth not supported in this browser. Use Chrome/Edge on desktop or Android.');
+  log('⚠️ Web Bluetooth API not available. Note: iOS Safari does not support Web Bluetooth.');
+}
+</script>
+
+<!--
+  Android note (fallback):
+  If Web Bluetooth is unavailable (iOS), use an Android app with nRF Connect or
+  write a React Native / Flutter app:
+    1. Scan for device named "ROVER_BLE"
+    2. Connect and discover service 12345678-1234-1234-1234-1234567890ab
+    3. Get CMD characteristic 12345678-1234-1234-1234-1234567890ac
+    4. Write 16-byte packets (format: magic RV, ver 1, flags, seq u32 LE, left i16, right i16, crc16)
+    5. Subscribe to ACK characteristic 12345678-1234-1234-1234-1234567890ad for telemetry
+  
+  iOS option: Use LightBlue Explorer app to manually write test packets,
+  or build a Swift app using CoreBluetooth framework with the same UUIDs.
+-->
+</body>
+</html>
